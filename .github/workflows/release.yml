@@ -1,0 +1,62 @@
+name: release
+
+# Horizon Service Monitor(Windows 11 트레이 앱) 빌드·게시.
+# - 모든 push: windows-latest에서 단일 exe 빌드(컴파일 검증) + 아티팩트 업로드.
+# - 태그(v*) push 또는 수동 실행(workflow_dispatch): 롤링 릴리스 'downloads'에 exe·version.json 게시.
+#   다운로드: https://github.com/noainred/horizon_mon/releases/download/downloads/HorizonServiceMonitor.exe
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['**']
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore
+        run: dotnet restore
+
+      - name: Publish single-file exe (win-x64, self-contained)
+        run: >
+          dotnet publish -c Release -r win-x64 --self-contained true
+          -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true
+          -o publish
+
+      - name: Read version from csproj
+        id: ver
+        shell: bash
+        run: |
+          v=$(sed -n 's:.*<Version>\(.*\)</Version>.*:\1:p' HorizonServiceMonitor.csproj | head -1)
+          echo "version=${v:-0.0.0}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HorizonServiceMonitor-exe
+          path: publish/HorizonServiceMonitor.exe
+          if-no-files-found: error
+
+      - name: Publish to rolling release
+        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          cd publish
+          printf '{"latest":"%s","exe":"HorizonServiceMonitor.exe"}\n' "$VERSION" > version.json
+          gh release view downloads >/dev/null 2>&1 || \
+            gh release create downloads --title "Horizon Service Monitor" \
+              --notes "13개 법인 VMware Horizon 서비스 모니터(Windows 11 트레이). 최신 빌드 자동 게시."
+          gh release upload downloads HorizonServiceMonitor.exe version.json --clobber

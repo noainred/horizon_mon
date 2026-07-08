@@ -1,0 +1,42 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Horizon Service Monitor — Windows 11 시스템 트레이 모니터링 프로그램.
+    전세계 13개 법인의 VMware Horizon 서비스(커넥션 서버)를 Horizon REST API로 주기 점검하고
+    커넥션서버/서비스/게이트웨이/팜/세션호스트(RDS)/이벤트DB/AD/vCenter 상태와 세션 통계를
+    법인별로 상세 표시한다. '닫기'는 트레이로 숨고, '종료'만 실제 종료.
+    단일 실행 파일(.exe) 빌드 방법은 README.md / build.ps1 참고(Win11 x64, self-contained).
+    산출물: bin/Release/net8.0-windows/win-x64/publish/HorizonServiceMonitor.exe
+  -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <RootNamespace>HorizonServiceMonitor</RootNamespace>
+    <AssemblyName>HorizonServiceMonitor</AssemblyName>
+    <Product>Horizon Service Monitor</Product>
+    <AssemblyTitle>Horizon Service Monitor</AssemblyTitle>
+    <Version>1.0.0</Version>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <!-- 리눅스 CI에서도 net8.0-windows 컴파일 검증이 가능하도록 허용(윈도우 빌드에는 영향 없음). -->
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <!-- 단일 exe 자동압축 해제 방식(네이티브 SQLite 포함). -->
+    <SelfContained>true</SelfContained>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <PublishSingleFile>true</PublishSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 자체 DB: 파일 기반 SQLite. SQLitePCLRaw 네이티브 번들 포함(추가 설치 불필요). -->
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.10" />
+    <!-- 법인 계정 비밀번호 저장용 DPAPI(사용자 단위 암호화). -->
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="8.0.0" />
+  </ItemGroup>
+
+</Project>
