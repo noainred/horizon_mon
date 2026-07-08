@@ -36,6 +36,23 @@
 - 운영자가 의도적으로 **비활성화**한 세션호스트/팜/풀(DISABLED)은 경고로 치지 않습니다.
 - 이벤트 DB **NOT_CONFIGURED**(미구성)는 정보로만 표시합니다.
 
+## 커넥션서버에 직접 접속이 안 되는 환경(UAG만 접속 가능)
+
+Horizon REST API(`/rest/...`)는 커넥션서버가 서비스하지만, **UAG가 `/rest` 경로를
+프록시하도록 설정하면 UAG 주소만으로 전체 기능이 동작**합니다.
+
+1. UAG 관리 UI 접속: `https://<UAG>:9443/admin`
+2. **Edge Service Settings → Horizon Settings → 고급 → Proxy Pattern** 에 `|/rest(.*)` 추가.
+   - 예: `(/|/view-client(.*)|/portal(.*)|/appblast(.*))` → `(/|/view-client(.*)|/portal(.*)|/appblast(.*)|/rest(.*))`
+3. 본 프로그램 설정에서 법인의 **커넥션서버 URL 자리에 UAG 주소**(예: `https://uag-oc1.corp.com`)를
+   입력하고 연결 테스트.
+
+> ⚠️ 보안: 인터넷 노출 UAG에 `/rest`를 열면 관리 API 로그인 표면이 외부에 노출됩니다.
+> 가능하면 내부용 UAG에만 적용하거나 방화벽으로 모니터링 PC IP만 허용하고,
+> 모니터링 계정은 읽기 전용 관리자 역할로 제한하세요.
+> `/rest` 미노출 상태로 접속하면 앱이 "로그인 실패(HTTP 404): /rest 미노출 — Proxy Pattern에
+> |/rest(.*) 추가 필요"로 안내합니다.
+
 ## 요구 사항
 
 - **Horizon 8 (2006 이상)** — REST API 기준. 신형 엔드포인트(풀 헬스, 세션 메트릭)는

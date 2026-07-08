@@ -19,7 +19,7 @@
     <AssemblyName>HorizonServiceMonitor</AssemblyName>
     <Product>Horizon Service Monitor</Product>
     <AssemblyTitle>Horizon Service Monitor</AssemblyTitle>
-    <Version>1.0.0</Version>
+    <Version>1.0.1</Version>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <!-- 리눅스 CI에서도 net8.0-windows 컴파일 검증이 가능하도록 허용(윈도우 빌드에는 영향 없음). -->
     <EnableWindowsTargeting>true</EnableWindowsTargeting>

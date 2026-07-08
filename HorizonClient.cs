@@ -124,6 +124,10 @@ public sealed class HorizonClient : IDisposable
         var text = await resp.Content.ReadAsStringAsync(cts.Token).ConfigureAwait(false);
         if (resp.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.BadRequest)
             throw new InvalidOperationException("로그인 거부(HTTP " + (int)resp.StatusCode + "): 계정/도메인/비밀번호 확인" + ApiErrorSuffix(text));
+        if (resp.StatusCode is HttpStatusCode.NotFound or HttpStatusCode.MethodNotAllowed or HttpStatusCode.Forbidden)
+            throw new InvalidOperationException(
+                $"로그인 실패(HTTP {(int)resp.StatusCode}): /rest 미노출 — UAG 주소라면 UAG 관리 UI(9443) › Horizon Settings › " +
+                "Proxy Pattern에 |/rest(.*) 추가 필요" + ApiErrorSuffix(text));
         if (!resp.IsSuccessStatusCode)
             throw new InvalidOperationException($"로그인 실패(HTTP {(int)resp.StatusCode})" + ApiErrorSuffix(text));
         using var doc = JsonDocument.Parse(text);
