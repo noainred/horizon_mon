@@ -47,6 +47,8 @@ public sealed class SettingsForm : Form
     private readonly Button _testBtn = new() { Text = "연결 테스트", AutoSize = true };
     private readonly Label _testResult = new() { AutoSize = true, ForeColor = Color.Gray, MaximumSize = new Size(380, 0) };
     private CancellationTokenSource? _testCts;
+    private int _testGen;          // 테스트 세대 — 늦게 끝난 이전 테스트가 새 테스트 결과를 덮지 않게
+    private bool _testRunning;
 
     // 전역 설정
     private readonly NumericUpDown _certWarn = new() { Minimum = 1, Maximum = 365, Value = 30 };
@@ -69,6 +71,7 @@ public sealed class SettingsForm : Form
         MinimumSize = new Size(920, 620);
         StartPosition = FormStartPosition.CenterParent;
         Font = new Font("Segoe UI", 9f);
+        AutoScaleMode = AutoScaleMode.Dpi;
         ShowIcon = false;
         ShowInTaskbar = false;
 
@@ -252,8 +255,9 @@ public sealed class SettingsForm : Form
             _notes.Text = c?.Notes ?? "";
             _testResult.Text = "";
             var editable = c != null;
-            foreach (Control ctl in new Control[] { _name, _code, _region, _url, _domain, _user, _pass, _interval, _timeout, _enabled, _inventory, _notes, _testBtn })
+            foreach (Control ctl in new Control[] { _name, _code, _region, _url, _domain, _user, _pass, _interval, _timeout, _enabled, _inventory, _notes })
                 ctl.Enabled = editable;
+            _testBtn.Enabled = editable && !_testRunning; // 테스트 진행 중 선택 변경으로 재활성화 금지
         }
         finally { _loadingFields = false; }
     }
@@ -342,28 +346,34 @@ public sealed class SettingsForm : Form
             PasswordEnc = _pendingPw.TryGetValue(c, out var pw) ? Crypto.Protect(pw) : c.PasswordEnc,
             TimeoutMs = c.TimeoutMs,
         };
+        var gen = ++_testGen; // 이 테스트의 세대 — 이후 UI 갱신은 최신 세대만 반영
+        _testRunning = true;
         _testBtn.Enabled = false;
         _testResult.ForeColor = Color.Gray;
-        _testResult.Text = "테스트 중…";
+        _testResult.Text = $"[{probe.DisplayName}] 테스트 중…";
         _testCts?.Cancel();
         _testCts = new CancellationTokenSource(TimeSpan.FromSeconds(45));
         try
         {
             using var client = new HorizonClient();
             var msg = await client.TestAsync(probe, _testCts.Token);
-            if (IsDisposed) return;
+            if (IsDisposed || gen != _testGen) return;
             _testResult.ForeColor = Color.SeaGreen;
-            _testResult.Text = msg;
+            _testResult.Text = $"[{probe.DisplayName}] {msg}";
         }
         catch (Exception ex)
         {
-            if (IsDisposed) return;
+            if (IsDisposed || gen != _testGen) return;
             _testResult.ForeColor = Color.Firebrick;
-            _testResult.Text = "실패: " + (ex.InnerException?.Message ?? ex.Message);
+            _testResult.Text = $"[{probe.DisplayName}] 실패: " + (ex.InnerException?.Message ?? ex.Message);
         }
         finally
         {
-            if (!IsDisposed) _testBtn.Enabled = _selected != null;
+            if (!IsDisposed && gen == _testGen)
+            {
+                _testRunning = false;
+                _testBtn.Enabled = _selected != null;
+            }
         }
     }
 

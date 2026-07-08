@@ -97,6 +97,8 @@ public sealed class Database : IDisposable
             );
             CREATE INDEX IF NOT EXISTS idx_samples_corp_ts ON samples (corp_id, ts);
             CREATE INDEX IF NOT EXISTS idx_samples_ts ON samples (ts);
+            -- 상세 prune(UPDATE ... WHERE detail_json IS NOT NULL)이 상세가 남은 소량 행만 스캔하도록.
+            CREATE INDEX IF NOT EXISTS idx_samples_detail_ts ON samples (ts) WHERE detail_json IS NOT NULL;
             CREATE TABLE IF NOT EXISTS latest_detail (
                 corp_id INTEGER PRIMARY KEY,
                 ts INTEGER NOT NULL,
@@ -367,29 +369,40 @@ public sealed class Database : IDisposable
     }
 
     /// <summary>보존기간 정리 — 숫자 시계열과 상세 JSON을 서로 다른 보존기간으로 정리한다.
-    /// ts 단독 인덱스가 있어 풀스캔 없이 범위 삭제된다.</summary>
+    /// 청크 단위로 나눠 사이사이 락(_gate)을 놓아 UI 스레드 조회가 굶지 않게 한다
+    /// (보존기간을 줄인 직후 대량 삭제로 단일 락을 길게 잡는 것을 방지).</summary>
     public void Prune(int retentionDays, int detailRetentionDays)
+    {
+        const int chunk = 20000;
+        if (retentionDays > 0)
+        {
+            var before = ToMs(DateTime.UtcNow.AddDays(-retentionDays));
+            while (ExecChunk("DELETE FROM samples WHERE id IN (SELECT id FROM samples WHERE ts < $before LIMIT $lim)", before, chunk) >= chunk) { }
+        }
+        if (detailRetentionDays > 0)
+        {
+            var before = ToMs(DateTime.UtcNow.AddDays(-detailRetentionDays));
+            // 부분 인덱스(idx_samples_detail_ts) 덕에 상세가 남은 소량 행만 스캔한다.
+            while (ExecChunk("UPDATE samples SET detail_json=NULL WHERE id IN (SELECT id FROM samples WHERE ts < $before AND detail_json IS NOT NULL LIMIT $lim)", before, chunk) >= chunk) { }
+        }
+        // 삭제된 법인의 고아 latest_detail 정리(수집 경쟁으로 재삽입된 행 포함).
+        lock (_gate)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "DELETE FROM latest_detail WHERE corp_id NOT IN (SELECT id FROM corps)";
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    private int ExecChunk(string sql, long before, int limit)
     {
         lock (_gate)
         {
-            using var tx = _conn.BeginTransaction();
-            if (retentionDays > 0)
-            {
-                using var cmd = _conn.CreateCommand();
-                cmd.Transaction = tx;
-                cmd.CommandText = "DELETE FROM samples WHERE ts < $before";
-                cmd.Parameters.AddWithValue("$before", ToMs(DateTime.UtcNow.AddDays(-retentionDays)));
-                cmd.ExecuteNonQuery();
-            }
-            if (detailRetentionDays > 0)
-            {
-                using var cmd = _conn.CreateCommand();
-                cmd.Transaction = tx;
-                cmd.CommandText = "UPDATE samples SET detail_json=NULL WHERE ts < $before AND detail_json IS NOT NULL";
-                cmd.Parameters.AddWithValue("$before", ToMs(DateTime.UtcNow.AddDays(-detailRetentionDays)));
-                cmd.ExecuteNonQuery();
-            }
-            tx.Commit();
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = sql;
+            cmd.Parameters.AddWithValue("$before", before);
+            cmd.Parameters.AddWithValue("$lim", limit);
+            return cmd.ExecuteNonQuery();
         }
     }
 

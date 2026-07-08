@@ -53,17 +53,20 @@ public sealed class MachineRow
 public sealed class HorizonClient : IDisposable
 {
     private readonly object _gate = new();
+    private readonly SemaphoreSlim _authSem = new(1, 1); // 로그인/갱신 직렬화(병렬 태스크 로그인 폭주 방지)
     private HttpClient? _http;
+    private bool _disposed;
     private string _identity = "";           // BaseUrl+Domain+User+PwEnc — 바뀌면 세션 재구성
     private string? _accessToken;
     private string? _refreshToken;
     private DateTime _tokenAtUtc;            // 발급 시각(선제 갱신용)
     private DateTime? _certNotAfterUtc;      // TLS 콜백에서 캡처한 서버 인증서 만료
-    private readonly ConcurrentDictionary<string, string> _resolvedVersion = new(); // endpoint → 성공한 버전
-    private readonly ConcurrentDictionary<string, byte> _unsupported = new();       // 미지원(404) 선택적 엔드포인트
-    private readonly ConcurrentDictionary<string, string> _userNameCache = new();   // user_id → 표시명
+    private readonly ConcurrentDictionary<string, string> _resolvedVersion = new();   // endpoint → 성공한 버전
+    private readonly ConcurrentDictionary<string, DateTime> _unsupported = new();     // 미지원(404) 선택적 엔드포인트 → 기록 시각
+    private readonly ConcurrentDictionary<string, string> _userNameCache = new();     // user_id → 표시명
 
     private const int TokenRefreshAfterMin = 20; // access token 선제 갱신(기본 만료 30분)
+    private static readonly TimeSpan UnsupportedRetryAfter = TimeSpan.FromHours(6); // 포드 업그레이드 대비 재시도 주기
 
     // ── HTTP 준비 ────────────────────────────────────────────────────────────
     private HttpClient GetHttp(Corporation corp)
@@ -71,6 +74,9 @@ public sealed class HorizonClient : IDisposable
         var id = corp.BaseUrl + "\n" + corp.Domain + "\n" + corp.Username + "\n" + corp.PasswordEnc;
         lock (_gate)
         {
+            // 리셋(설정 변경/삭제)으로 파기된 클라이언트를 되살리지 않는다 —
+            // in-flight 요청은 여기서 던지고 Guard/호출부가 결과를 폐기한다.
+            ObjectDisposedException.ThrowIf(_disposed, this);
             if (_http != null && _identity == id) return _http;
             _http?.Dispose();
             var handler = new HttpClientHandler
@@ -155,8 +161,29 @@ public sealed class HorizonClient : IDisposable
     {
         GetHttp(corp); // identity 변화 감지(토큰 무효화)
         if (_accessToken != null && (DateTime.UtcNow - _tokenAtUtc).TotalMinutes < TokenRefreshAfterMin) return;
-        if (_accessToken != null && await TryRefreshAsync(corp, ct).ConfigureAwait(false)) return;
-        await LoginAsync(corp, ct).ConfigureAwait(false);
+        await _authSem.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            // 대기 중 다른 태스크가 이미 갱신했으면 종료(로그인 폭주 방지).
+            if (_accessToken != null && (DateTime.UtcNow - _tokenAtUtc).TotalMinutes < TokenRefreshAfterMin) return;
+            if (_accessToken != null && await TryRefreshAsync(corp, ct).ConfigureAwait(false)) return;
+            await LoginAsync(corp, ct).ConfigureAwait(false);
+        }
+        finally { _authSem.Release(); }
+    }
+
+    /// <summary>401 수신 후 재인증 — usedToken이 이미 교체돼 있으면 갱신 생략(중복 로그인 방지),
+    /// 아니면 refresh → 실패 시 재로그인.</summary>
+    private async Task ReauthAsync(Corporation corp, string? usedToken, CancellationToken ct)
+    {
+        await _authSem.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            if (_accessToken != null && _accessToken != usedToken) return; // 다른 태스크가 이미 갱신
+            if (await TryRefreshAsync(corp, ct).ConfigureAwait(false)) return;
+            await LoginAsync(corp, ct).ConfigureAwait(false);
+        }
+        finally { _authSem.Release(); }
     }
 
     private static string ApiErrorSuffix(string body)
@@ -179,14 +206,14 @@ public sealed class HorizonClient : IDisposable
         for (int attempt = 0; ; attempt++)
         {
             var http = GetHttp(corp);
+            var token = _accessToken; // 지역 복사 — 병렬 태스크의 토큰 교체와 무관하게 일관된 헤더 사용
             using var cts = Linked(corp, ct);
             using var req = new HttpRequestMessage(HttpMethod.Get, corp.BaseUrl + path);
-            req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _accessToken);
+            req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
             using var resp = await http.SendAsync(req, HttpCompletionOption.ResponseContentRead, cts.Token).ConfigureAwait(false);
             if (resp.StatusCode == HttpStatusCode.Unauthorized && attempt == 0)
             {
-                _accessToken = null; // 만료 → 갱신/재로그인 후 재시도
-                await EnsureAuthAsync(corp, ct).ConfigureAwait(false);
+                await ReauthAsync(corp, token, ct).ConfigureAwait(false); // 만료 → 갱신/재로그인 후 재시도
                 continue;
             }
             var body = await resp.Content.ReadAsStringAsync(cts.Token).ConfigureAwait(false);
@@ -226,17 +253,36 @@ public sealed class HorizonClient : IDisposable
         throw new HttpRequestException($"{endpoint}: HTTP {(int)last}{ApiErrorSuffix(lastBody)}", null, last);
     }
 
-    /// <summary>인벤토리 목록 GET(페이지네이션) — rows 상한까지 page 루프. size 최대 1000(스펙).</summary>
-    private async Task<List<JsonElement>> GetInventoryListAsync(Corporation corp, string endpoint, int maxRows, CancellationToken ct)
+    /// <summary>인벤토리 목록 GET(페이지네이션 + 버전 폴백) — rows 상한까지 page 루프. size 최대 1000(스펙).
+    /// Truncated=true면 상한 도달로 서버에 더 많은 행이 남아 있다.</summary>
+    private async Task<(List<JsonElement> Items, bool Truncated)> GetInventoryListAsync(
+        Corporation corp, string endpoint, int maxRows, CancellationToken ct, params string[] versions)
     {
+        if (versions.Length == 0) versions = new[] { "v1" };
+        var cacheKey = "inv:" + endpoint;
+        string ver = _resolvedVersion.TryGetValue(cacheKey, out var known) ? known : versions[0];
+
         var items = new List<JsonElement>();
+        bool hasMore = false;
         int page = 1;
         const int size = 1000;
         while (items.Count < maxRows)
         {
-            var r = await GetRawAsync(corp, $"/rest/inventory/v1/{endpoint}?page={page}&size={size}", ct).ConfigureAwait(false);
+            var r = await GetRawAsync(corp, $"/rest/inventory/{ver}/{endpoint}?page={page}&size={size}", ct).ConfigureAwait(false);
+            if (r.Code is HttpStatusCode.NotFound or HttpStatusCode.BadRequest && page == 1)
+            {
+                // 버전 폴백(v2 미지원 구버전 등) — 다음 후보 시도.
+                var idx = Array.IndexOf(versions, ver);
+                if (idx >= 0 && idx + 1 < versions.Length)
+                {
+                    ver = versions[idx + 1];
+                    _resolvedVersion.TryRemove(cacheKey, out _);
+                    continue;
+                }
+            }
             if (r.Code != HttpStatusCode.OK)
                 throw new HttpRequestException($"{endpoint}: HTTP {(int)r.Code}{ApiErrorSuffix(r.Body)}", null, r.Code);
+            _resolvedVersion[cacheKey] = ver;
             using var doc = JsonDocument.Parse(r.Body);
             if (doc.RootElement.ValueKind != JsonValueKind.Array) break;
             foreach (var el in doc.RootElement.EnumerateArray())
@@ -244,10 +290,11 @@ public sealed class HorizonClient : IDisposable
                 items.Add(el.Clone());
                 if (items.Count >= maxRows) break;
             }
+            hasMore = r.HasMore;
             if (!r.HasMore || doc.RootElement.GetArrayLength() == 0) break;
             page++;
         }
-        return items;
+        return (items, items.Count >= maxRows && hasMore);
     }
 
     // ── 스냅샷 수집 ──────────────────────────────────────────────────────────
@@ -337,14 +384,16 @@ public sealed class HorizonClient : IDisposable
         {
             await Guard(snap, "desktop-pools", async () =>
             {
-                var pools = await GetInventoryListAsync(corp, "desktop-pools", 500, ct).ConfigureAwait(false);
+                // enable_provisioning은 v2+에만 존재 — v2 우선, 구버전이면 v1 폴백.
+                var (pools, _) = await GetInventoryListAsync(corp, "desktop-pools", 500, ct, "v2", "v1").ConfigureAwait(false);
                 MergeInventoryPools(snap, pools);
             }).ConfigureAwait(false);
 
             await Guard(snap, "machines", async () =>
             {
-                var machines = await GetInventoryListAsync(corp, "machines", 10000, ct).ConfigureAwait(false);
+                var (machines, truncated) = await GetInventoryListAsync(corp, "machines", 10000, ct).ConfigureAwait(false);
                 snap.MachineTotal = machines.Count;
+                snap.MachinesTruncated = truncated;
                 var poolNames = snap.DesktopPools.Where(p => p.Id != null).ToDictionary(p => p.Id!, p => p.Name);
                 var problems = new List<MachineProblem>();
                 var problemByPool = new Dictionary<string, int>();
@@ -374,8 +423,8 @@ public sealed class HorizonClient : IDisposable
                 await Guard(snap, "sessions", async () =>
                 {
                     const int cap = 20000;
-                    var sessions = await GetInventoryListAsync(corp, "sessions", cap, ct).ConfigureAwait(false);
-                    var sum = new SessionSummary { Total = sessions.Count, Truncated = sessions.Count >= cap };
+                    var (sessions, truncated) = await GetInventoryListAsync(corp, "sessions", cap, ct).ConfigureAwait(false);
+                    var sum = new SessionSummary { Total = sessions.Count, Truncated = truncated };
                     foreach (var s in sessions)
                     {
                         var state = (J.Str(s, "session_state") ?? "").ToUpperInvariant();
@@ -397,7 +446,12 @@ public sealed class HorizonClient : IDisposable
         sw.Stop();
         snap.DurationMs = sw.Elapsed.TotalMilliseconds;
         SetApiCertDays(snap);
-        if (snap.ConnectionServers.Count == 0 && snap.EndpointErrors.Count > 0 && snap.Error == null)
+        // Down 판정(Error 설정)은 '모든' 모니터 엔드포인트가 실패해 데이터가 전무할 때만.
+        // connection-servers 1개만 일시 실패한 경우는 EndpointErrors 기반 Warn으로 처리한다.
+        var anyData = snap.ConnectionServers.Count > 0 || snap.Gateways.Count > 0 || snap.Farms.Count > 0 ||
+                      snap.RdsServers.Count > 0 || snap.AdDomains.Count > 0 || snap.VirtualCenters.Count > 0 ||
+                      snap.SamlAuthenticators.Count > 0 || snap.EventDb != null;
+        if (!anyData && snap.EndpointErrors.Count > 0 && snap.Error == null)
             snap.Error = "수집 실패: " + string.Join("; ", snap.EndpointErrors.Take(2));
         return snap;
     }
@@ -417,17 +471,22 @@ public sealed class HorizonClient : IDisposable
         }
     }
 
-    /// <summary>선택적 엔드포인트 — 미지원(404/400)이면 기억하고 조용히 생략(경고 없음).</summary>
+    /// <summary>선택적 엔드포인트 — 미지원(404/400)이면 기억하고 조용히 생략(경고 없음).
+    /// 포드 업그레이드로 지원될 수 있으므로 일정 시간 후 재시도한다.</summary>
     private Task GuardOptional(CorpSnapshot snap, string name, Func<Task> work)
     {
-        if (_unsupported.ContainsKey(name)) return Task.CompletedTask;
+        if (_unsupported.TryGetValue(name, out var at))
+        {
+            if (DateTime.UtcNow - at < UnsupportedRetryAfter) return Task.CompletedTask;
+            _unsupported.TryRemove(name, out _);
+        }
         return Run();
         async Task Run()
         {
             try { await work().ConfigureAwait(false); }
             catch (HttpRequestException hex) when (hex.StatusCode is HttpStatusCode.NotFound or HttpStatusCode.BadRequest)
             {
-                _unsupported[name] = 1; // 구버전 — 다음부터 시도 안 함
+                _unsupported[name] = DateTime.UtcNow; // 구버전 — 당분간 시도 안 함
             }
             catch (Exception ex)
             {
@@ -780,7 +839,7 @@ public sealed class HorizonClient : IDisposable
     /// <summary>세션 목록(상세 탭 온디맨드). 사용자/머신/풀 이름을 가능한 만큼 해석한다.</summary>
     public async Task<List<SessionRow>> FetchSessionsAsync(Corporation corp, int maxRows, CancellationToken ct)
     {
-        var sessions = await GetInventoryListAsync(corp, "sessions", maxRows, ct).ConfigureAwait(false);
+        var (sessions, _) = await GetInventoryListAsync(corp, "sessions", maxRows, ct).ConfigureAwait(false);
 
         // 이름 해석용 보조 맵(실패해도 세션 목록은 반환).
         var machineNames = new Dictionary<string, string>();
@@ -789,13 +848,15 @@ public sealed class HorizonClient : IDisposable
         var farmNames = new Dictionary<string, string>();
         try
         {
-            foreach (var m in await GetInventoryListAsync(corp, "machines", 10000, ct).ConfigureAwait(false))
+            var (machines, _) = await GetInventoryListAsync(corp, "machines", 10000, ct).ConfigureAwait(false);
+            foreach (var m in machines)
                 if (J.Str(m, "id") is string id && J.Str(m, "name") is string nm) machineNames[id] = nm;
         }
         catch { /* ignore */ }
         try
         {
-            foreach (var p in await GetInventoryListAsync(corp, "desktop-pools", 500, ct).ConfigureAwait(false))
+            var (pools, _) = await GetInventoryListAsync(corp, "desktop-pools", 500, ct, "v2", "v1").ConfigureAwait(false);
+            foreach (var p in pools)
                 if (J.Str(p, "id") is string id && J.Str(p, "name") is string nm) poolNames[id] = nm;
         }
         catch { /* ignore */ }
@@ -875,12 +936,13 @@ public sealed class HorizonClient : IDisposable
         var poolNames = new Dictionary<string, string>();
         try
         {
-            foreach (var p in await GetInventoryListAsync(corp, "desktop-pools", 500, ct).ConfigureAwait(false))
+            var (pools, _) = await GetInventoryListAsync(corp, "desktop-pools", 500, ct, "v2", "v1").ConfigureAwait(false);
+            foreach (var p in pools)
                 if (J.Str(p, "id") is string id && J.Str(p, "name") is string nm) poolNames[id] = nm;
         }
         catch { /* ignore */ }
 
-        var machines = await GetInventoryListAsync(corp, "machines", maxRows, ct).ConfigureAwait(false);
+        var (machines, _) = await GetInventoryListAsync(corp, "machines", maxRows, ct).ConfigureAwait(false);
         return machines.Select(m =>
         {
             var poolId = J.Str(m, "desktop_pool_id");
@@ -899,9 +961,11 @@ public sealed class HorizonClient : IDisposable
     {
         lock (_gate)
         {
+            _disposed = true; // GetHttp가 새 HttpClient를 되살리지 못하게(리셋 후 유령 요청 방지)
             _http?.Dispose();
             _http = null;
         }
+        try { _authSem.Dispose(); } catch { /* in-flight 대기자가 있으면 무시 */ }
     }
 }
 

@@ -211,6 +211,8 @@ public sealed class CorpSnapshot
     public List<PoolInfo> DesktopPools { get; set; } = new();
     public SessionSummary? Sessions { get; set; }
     public int? MachineTotal { get; set; }
+    /// <summary>머신 인벤토리가 페이지 상한에서 절단되어 일부만 집계된 경우.</summary>
+    public bool? MachinesTruncated { get; set; }
     public List<MachineProblem> ProblemMachines { get; set; } = new();
     /// <summary>엔드포인트별 부분 실패("gateways: 404 미지원" 등) — 전체 Down은 아님.</summary>
     public List<string> EndpointErrors { get; set; } = new();

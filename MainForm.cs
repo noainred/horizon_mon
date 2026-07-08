@@ -50,6 +50,7 @@ public sealed class MainForm : Form
         StartPosition = FormStartPosition.CenterScreen;
         MinimumSize = new Size(880, 520);
         Font = new Font("Segoe UI", 9f);
+        AutoScaleMode = AutoScaleMode.Dpi; // 고DPI에서 고정 크기 패널/컬럼 스케일
         BackColor = Color.White;
 
         var tool = new ToolStrip { GripStyle = ToolStripGripStyle.Hidden, Padding = new Padding(6, 2, 6, 2), Renderer = new ToolStripProfessionalRenderer() };
@@ -244,7 +245,8 @@ public sealed class MainForm : Form
         Col("cert", "인증서(일)", 8);
         Col("checked", "마지막 수집", 11);
         // 제목 클릭 정렬(오름/내림 토글). 자동 새로고침에도 유지되도록 데이터 정렬 방식 사용.
-        foreach (DataGridViewColumn c in _grid.Columns) c.SortMode = DataGridViewColumnSortMode.NotSortable;
+        // Programmatic: 자동 정렬은 끄되 SortGlyphDirection 설정은 허용(NotSortable이면 글리프 설정이 예외).
+        foreach (DataGridViewColumn c in _grid.Columns) c.SortMode = DataGridViewColumnSortMode.Programmatic;
         _grid.ColumnHeaderMouseClick += (_, e) => OnHeaderClick(e.ColumnIndex);
     }
 
@@ -313,6 +315,9 @@ public sealed class MainForm : Form
     private void RefreshGrid(List<CorpStatus> snap)
     {
         snap = SortSnap(snap); // 현재 정렬 컬럼/방향으로 정렬(자동 새로고침에도 유지)
+        // 자동 새로고침이 선택/스크롤 위치를 날리지 않게 보존 후 복원.
+        var selectedId = _grid.CurrentRow?.Tag as long?;
+        var scrollIdx = _grid.FirstDisplayedScrollingRowIndex;
         _grid.SuspendLayout();
         _grid.Rows.Clear();
         foreach (var cs in snap)
@@ -339,6 +344,24 @@ public sealed class MainForm : Form
             if (!c.Enabled) row.DefaultCellStyle.ForeColor = Color.Gray;
             if (s?.Error != null) foreach (DataGridViewCell cell in row.Cells) cell.ToolTipText = s.Error;
         }
+        // 선택/스크롤 복원.
+        try
+        {
+            if (selectedId is long sid)
+            {
+                foreach (DataGridViewRow row in _grid.Rows)
+                {
+                    if (row.Tag is long id && id == sid)
+                    {
+                        _grid.CurrentCell = row.Cells[0];
+                        break;
+                    }
+                }
+            }
+            if (scrollIdx >= 0 && _grid.Rows.Count > 0)
+                _grid.FirstDisplayedScrollingRowIndex = Math.Min(scrollIdx, _grid.Rows.Count - 1);
+        }
+        catch { /* 복원 실패는 무시 */ }
         _grid.ResumeLayout();
     }
 
@@ -456,7 +479,12 @@ public sealed class MainForm : Form
         private static readonly Font FPill = new("Segoe UI", 9.5f, FontStyle.Bold);
         private int _up, _warn, _down, _unknown, _total, _sessions, _hosts;
 
-        public SummaryHeader() { DoubleBuffered = true; BackColor = Color.FromArgb(33, 41, 54); }
+        public SummaryHeader()
+        {
+            DoubleBuffered = true;
+            ResizeRedraw = true; // 우측 정렬 알약이 리사이즈 때 잔상 없이 전체 다시 그리기
+            BackColor = Color.FromArgb(33, 41, 54);
+        }
 
         public void SetCounts(int up, int warn, int down, int unknown, int total, int sessions, int hosts)
         {

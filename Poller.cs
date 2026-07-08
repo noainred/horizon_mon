@@ -161,6 +161,7 @@ public sealed class Poller : IDisposable
     private async Task RunCheckAsync(Corporation corp, CancellationToken token)
     {
         bool acquired = false;
+        HorizonClient? client = null;
         try
         {
             await _concurrency.WaitAsync(token).ConfigureAwait(false);
@@ -169,20 +170,16 @@ public sealed class Poller : IDisposable
             var count = _pollCount.AddOrUpdate(corp.Id, 1, (_, v) => v + 1);
             var includeInventory = corp.CollectInventory && (count == 1 || count % InventoryEveryN == 0);
 
-            var client = _clients.GetOrAdd(corp.Id, _ => new HorizonClient());
+            client = _clients.GetOrAdd(corp.Id, _ => new HorizonClient());
             var snap = await client.FetchSnapshotAsync(corp, includeInventory, token).ConfigureAwait(false);
 
-            // 인벤토리를 이번 주기에 건너뛰었으면 직전 값을 이월(카드 수치 깜빡임 방지 — 최대 N주기 지연).
-            if (!includeInventory && _latest.TryGetValue(corp.Id, out var prev) && prev != null)
-            {
-                snap.Sessions ??= prev.Sessions;
-                snap.MachineTotal ??= prev.MachineTotal;
-                if (snap.ProblemMachines.Count == 0 && prev.ProblemMachines.Count > 0)
-                    snap.ProblemMachines = prev.ProblemMachines;
-                if (snap.DesktopPools.Count == 0 && prev.DesktopPools.Count > 0)
-                    snap.DesktopPools = prev.DesktopPools;
-            }
+            // 종료 취소 중이거나(FetchSnapshot는 취소를 '시간 초과' 실패로 환원한다),
+            // 설정 저장/삭제로 클라이언트가 리셋되었으면 이번 결과를 폐기 — 가짜 Down 샘플이
+            // DB·latest에 남아 다음 기동 때 잘못된 상태로 복원되는 것을 방지.
+            if (token.IsCancellationRequested) return;
+            if (!_clients.TryGetValue(corp.Id, out var cur) || !ReferenceEquals(cur, client)) return;
 
+            CarryForwardInventory(corp.Id, snap);
             HealthEvaluator.Evaluate(snap, Thresholds);
 
             var prevStatus = _latest.TryGetValue(corp.Id, out var p) ? p.Status : HealthStatus.Unknown;
@@ -204,6 +201,8 @@ public sealed class Poller : IDisposable
             {
                 try
                 {
+                    // 클라이언트가 리셋(설정 변경/삭제)된 경우 결과 폐기.
+                    if (client != null && (!_clients.TryGetValue(corp.Id, out var cur2) || !ReferenceEquals(cur2, client))) return;
                     var snap = new CorpSnapshot
                     {
                         CorpId = corp.Id,
@@ -211,6 +210,7 @@ public sealed class Poller : IDisposable
                         Status = HealthStatus.Down,
                         Error = "수집 실패: " + (ex.InnerException?.Message ?? ex.Message),
                     };
+                    CarryForwardInventory(corp.Id, snap);
                     var prevStatus = _latest.TryGetValue(corp.Id, out var p2) ? p2.Status : HealthStatus.Unknown;
                     _db.InsertSample(snap, prevStatus != HealthStatus.Down);
                     _latest[corp.Id] = snap;
@@ -229,6 +229,23 @@ public sealed class Poller : IDisposable
             lock (_gate) { _inFlight.Remove(corp.Id); }
             if (acquired) { try { Updated?.Invoke(); } catch { /* ignore */ } }
         }
+    }
+
+    /// <summary>인벤토리(머신/세션/풀) 데이터가 이번 스냅샷에 없으면 직전 값을 이월.
+    /// '수집 주기 스킵'뿐 아니라 '수집 실패' 시에도 마지막으로 아는 값을 유지한다(수치 깜빡임/소실 방지).</summary>
+    private void CarryForwardInventory(long corpId, CorpSnapshot snap)
+    {
+        if (!_latest.TryGetValue(corpId, out var prev) || prev == null) return;
+        snap.Sessions ??= prev.Sessions;
+        if (snap.MachineTotal == null)
+        {
+            snap.MachineTotal = prev.MachineTotal;
+            snap.MachinesTruncated ??= prev.MachinesTruncated;
+            if (snap.ProblemMachines.Count == 0 && prev.ProblemMachines.Count > 0)
+                snap.ProblemMachines = prev.ProblemMachines;
+        }
+        if (snap.DesktopPools.Count == 0 && prev.DesktopPools.Count > 0)
+            snap.DesktopPools = prev.DesktopPools;
     }
 
     public void Dispose()

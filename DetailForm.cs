@@ -78,6 +78,7 @@ public sealed class DetailForm : Form
     private readonly System.Windows.Forms.Timer _uiTimer = new() { Interval = 1000 };
     private volatile bool _dirty = true;
     private DateTime _lastShownTs = DateTime.MinValue;
+    private TabPage? _histPage; // 이력 탭 — 보일 때만 무거운 이력 쿼리 실행
 
     public DetailForm(Database db, Poller poller, Corporation corp)
     {
@@ -91,6 +92,7 @@ public sealed class DetailForm : Form
         MinimumSize = new Size(980, 620);
         StartPosition = FormStartPosition.CenterParent;
         Font = new Font("Segoe UI", 9f);
+        AutoScaleMode = AutoScaleMode.Dpi;
         ShowIcon = false;
         ShowInTaskbar = false;
 
@@ -129,7 +131,8 @@ public sealed class DetailForm : Form
         _poller.Updated += OnPollerUpdated;
         _uiTimer.Tick += (_, _) => { if (_dirty) { _dirty = false; RefreshData(); } };
         _uiTimer.Start();
-        Load += (_, _) => { RefreshData(); RefreshHistory(); };
+        _tabs.SelectedIndexChanged += (_, _) => { if (_tabs.SelectedTab == _histPage) RefreshHistory(); };
+        Load += (_, _) => RefreshData();
         FormClosed += (_, _) =>
         {
             _poller.Updated -= OnPollerUpdated;
@@ -285,6 +288,7 @@ public sealed class DetailForm : Form
     private TabPage MakeHistoryTab()
     {
         var page = new TabPage("이력");
+        _histPage = page;
         var top = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 38, Padding = new Padding(6, 6, 0, 0) };
         _histRange.Items.AddRange(new object[] { "3시간", "12시간", "24시간", "7일", "30일", "90일" });
         _histRange.SelectedIndex = 2;
@@ -335,7 +339,8 @@ public sealed class DetailForm : Form
         RefreshSessionSummary(s);
         RefreshInfra(s);
         if (!_machFetched) RefreshMachinesFromSnapshot(s);
-        RefreshHistory();
+        // 이력은 무거운 쿼리(최대 5만 행)라 탭이 보일 때만 갱신.
+        if (_tabs.SelectedTab == _histPage) RefreshHistory();
     }
 
     private void RefreshOverview(CorpSnapshot s)
@@ -659,7 +664,9 @@ public sealed class DetailForm : Form
     {
         _machRows = s.ProblemMachines.Select(m => new MachineRow { Name = m.Name, State = m.State, Pool = m.Pool ?? "" }).ToList();
         _machInfo.Text = s.MachineTotal is int t
-            ? $"주기 수집 기준: 전체 {t:N0}대 중 문제 {s.ProblemMachines.Count}대 (전체 목록은 '전체 머신 조회')"
+            ? $"주기 수집 기준: 전체 {t:N0}대 중 문제 {s.ProblemMachines.Count}대" +
+              (s.MachinesTruncated == true ? " · ⚠ 페이지 상한 도달(일부만 집계)" : "") +
+              " (전체 목록은 '전체 머신 조회')"
             : "인벤토리 수집 대기 중 — '전체 머신 조회'로 즉시 확인 가능";
         RefreshMachines();
     }
@@ -727,7 +734,8 @@ public sealed class DetailForm : Form
         var warnCount = pts.Count(p => p.Status == HealthStatus.Warn);
         var downCount = pts.Count(p => p.Status == HealthStatus.Down);
         _histStats.Text = $"표본 {pts.Count:N0} · 정상율 {(double)upCount / pts.Count * 100:F1}% · 주의 {warnCount} · 위험 {downCount}" +
-                          $" · 세션 평균 {pts.Average(p => p.Sessions):F0} / 최대 {pts.Max(p => p.Sessions):N0}";
+                          $" · 세션 평균 {pts.Average(p => p.Sessions):F0} / 최대 {pts.Max(p => p.Sessions):N0}" +
+                          (pts.Count >= 50000 ? " · ⚠ 조회 상한 도달(최신 구간만 표시)" : "");
 
         _histTrans.BeginUpdate();
         _histTrans.Items.Clear();
@@ -782,22 +790,72 @@ public sealed class DetailForm : Form
         catch (Exception ex) { MessageBox.Show(this, ex.Message, "CSV 오류", MessageBoxButtons.OK, MessageBoxIcon.Error); }
     }
 
-    /// <summary>이력 차트 — 세션 수 라인 + 상태 색 점 + 위험 구간 세로선. 축 라벨 포함.</summary>
+    /// <summary>이력 차트 — 세션 수 라인 + 상태 색 점 + 위험 구간 세로선. 축 라벨 포함.
+    /// 점이 픽셀 폭보다 많으면 픽셀 열 단위로 다운샘플(세션 평균·최악 상태 유지)해
+    /// 장기 범위(수만 점)에서도 페인트가 가볍다. 브러시/펜은 캐시해 점당 할당 금지.</summary>
     private sealed class HistoryChart : Panel
     {
         private static readonly Font FAxis = new("Segoe UI", 8f);
+        private static readonly Brush BrUp = new SolidBrush(MainForm.StatusColor(HealthStatus.Up, true));
+        private static readonly Brush BrWarn = new SolidBrush(MainForm.StatusColor(HealthStatus.Warn, true));
+        private static readonly Brush BrDown = new SolidBrush(MainForm.StatusColor(HealthStatus.Down, true));
+        private static readonly Brush BrUnknown = new SolidBrush(MainForm.StatusColor(HealthStatus.Unknown, true));
+        private static readonly Pen PenDown = new(Color.FromArgb(70, 214, 60, 60));
+        private static readonly Pen PenLine = new(Color.FromArgb(160, 52, 199, 89), 1.6f);
+        private static readonly Pen PenGrid = new(Color.FromArgb(238, 240, 243));
         private List<HistoryPoint> _pts = new();
 
-        public HistoryChart() { DoubleBuffered = true; BackColor = Color.White; }
+        public HistoryChart() { DoubleBuffered = true; ResizeRedraw = true; BackColor = Color.White; }
 
         public void SetData(List<HistoryPoint> pts) { _pts = pts; Invalidate(); }
+
+        private static Brush StatusBrush(HealthStatus s) => s switch
+        {
+            HealthStatus.Up => BrUp, HealthStatus.Warn => BrWarn, HealthStatus.Down => BrDown, _ => BrUnknown,
+        };
+
+        /// <summary>픽셀 열당 1점으로 축약 — 세션은 평균, 상태는 최악값(Down>Warn>Unknown>Up) 유지.</summary>
+        private static List<HistoryPoint> Downsample(List<HistoryPoint> pts, int columns, DateTime t0, double spanSec)
+        {
+            if (pts.Count <= columns * 2 || columns < 8) return pts;
+            static int Rank(HealthStatus s) => s switch
+            {
+                HealthStatus.Down => 3, HealthStatus.Warn => 2, HealthStatus.Unknown => 1, _ => 0,
+            };
+            var buckets = new (long SumSessions, int Count, HealthStatus Worst, long TicksSum)[columns];
+            foreach (var p in pts)
+            {
+                int col = (int)((p.TimestampUtc - t0).TotalSeconds / spanSec * (columns - 1));
+                col = Math.Clamp(col, 0, columns - 1);
+                ref var b = ref buckets[col];
+                b.SumSessions += p.Sessions;
+                b.TicksSum += p.TimestampUtc.Ticks / 1000; // 오버플로 방지 축소
+                if (b.Count == 0 || Rank(p.Status) > Rank(b.Worst)) b.Worst = p.Status;
+                b.Count++;
+            }
+            var outPts = new List<HistoryPoint>(columns);
+            for (int i = 0; i < columns; i++)
+            {
+                var b = buckets[i];
+                if (b.Count == 0) continue;
+                outPts.Add(new HistoryPoint
+                {
+                    TimestampUtc = new DateTime(b.TicksSum / b.Count * 1000, DateTimeKind.Utc),
+                    Sessions = (int)(b.SumSessions / b.Count),
+                    Status = b.Worst,
+                });
+            }
+            return outPts;
+        }
 
         protected override void OnPaint(PaintEventArgs e)
         {
             base.OnPaint(e);
             var g = e.Graphics;
             g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-            var area = new Rectangle(52, 12, Math.Max(60, Width - 66), Math.Max(40, Height - 44));
+            float dpiS = DeviceDpi / 96f;
+            int m = (int)(52 * dpiS);
+            var area = new Rectangle(m, (int)(12 * dpiS), Math.Max(60, Width - m - (int)(14 * dpiS)), Math.Max(40, Height - (int)(44 * dpiS)));
             using var gray = new SolidBrush(Color.FromArgb(134, 142, 150));
 
             if (_pts.Count == 0)
@@ -806,54 +864,49 @@ public sealed class DetailForm : Form
                 return;
             }
 
-            double max = Math.Max(1, _pts.Max(p => p.Sessions)) * 1.15;
             var t0 = _pts[0].TimestampUtc;
             var t1 = _pts[^1].TimestampUtc;
             double span = Math.Max(1, (t1 - t0).TotalSeconds);
+            var pts = Downsample(_pts, area.Width, t0, span);
+            double max = Math.Max(1, _pts.Max(p => p.Sessions)) * 1.15;
             float X(DateTime t) => area.X + (float)(area.Width * (t - t0).TotalSeconds / span);
             float Y(double v) => area.Bottom - (float)(area.Height * Math.Min(v, max) / max);
 
             // 격자 + Y축 라벨
-            using (var grid = new Pen(Color.FromArgb(238, 240, 243)))
+            for (int i = 0; i <= 4; i++)
             {
-                for (int i = 0; i <= 4; i++)
-                {
-                    float y = area.Y + area.Height * i / 4f;
-                    g.DrawLine(grid, area.X, y, area.Right, y);
-                    var v = max * (4 - i) / 4;
-                    g.DrawString(v.ToString("N0"), FAxis, gray, 4, y - 6);
-                }
+                float y = area.Y + area.Height * i / 4f;
+                g.DrawLine(PenGrid, area.X, y, area.Right, y);
+                var v = max * (4 - i) / 4;
+                g.DrawString(v.ToString("N0"), FAxis, gray, 4, y - 6);
             }
             // X축 라벨(시작/중간/끝)
             g.DrawString(t0.ToLocalTime().ToString("MM-dd HH:mm"), FAxis, gray, area.X, area.Bottom + 4);
-            var mid = t0.AddSeconds(span / 2);
-            g.DrawString(mid.ToLocalTime().ToString("MM-dd HH:mm"), FAxis, gray, area.X + area.Width / 2 - 30, area.Bottom + 4);
+            var midT = t0.AddSeconds(span / 2);
+            g.DrawString(midT.ToLocalTime().ToString("MM-dd HH:mm"), FAxis, gray, area.X + area.Width / 2 - 30, area.Bottom + 4);
             var endText = t1.ToLocalTime().ToString("MM-dd HH:mm");
             g.DrawString(endText, FAxis, gray, area.Right - g.MeasureString(endText, FAxis).Width, area.Bottom + 4);
 
             // 위험(다운) 세로선 먼저(라인 아래 깔림)
-            foreach (var p in _pts.Where(p => p.Status == HealthStatus.Down))
+            foreach (var p in pts)
             {
-                using var pen = new Pen(Color.FromArgb(70, 214, 60, 60));
+                if (p.Status != HealthStatus.Down) continue;
                 var x = X(p.TimestampUtc);
-                g.DrawLine(pen, x, area.Y, x, area.Bottom);
+                g.DrawLine(PenDown, x, area.Y, x, area.Bottom);
             }
 
             // 세션 라인
-            var line = _pts.Select(p => new PointF(X(p.TimestampUtc), Y(p.Sessions))).ToArray();
-            if (line.Length > 1)
+            if (pts.Count > 1)
             {
-                using var pen = new Pen(Color.FromArgb(160, 52, 199, 89), 1.6f);
-                g.DrawLines(pen, line);
+                var line = pts.Select(p => new PointF(X(p.TimestampUtc), Y(p.Sessions))).ToArray();
+                g.DrawLines(PenLine, line);
             }
 
             // 상태 점
-            foreach (var p in _pts)
+            foreach (var p in pts)
             {
-                var c = MainForm.StatusColor(p.Status, true);
-                using var br = new SolidBrush(c);
                 float r = p.Status == HealthStatus.Up ? 1.6f : 2.6f;
-                g.FillEllipse(br, X(p.TimestampUtc) - r, Y(p.Sessions) - r, r * 2, r * 2);
+                g.FillEllipse(StatusBrush(p.Status), X(p.TimestampUtc) - r, Y(p.Sessions) - r, r * 2, r * 2);
             }
         }
     }

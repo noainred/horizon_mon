@@ -39,11 +39,13 @@ public static class HealthEvaluator
         var reasons = new List<string>();
 
         // 커넥션서버 & 내부 서비스
+        // RESTART_REQUIRED(v3 enum)는 서비스 자체는 동작 중 — Down('전멸') 판정에서 제외하고 Warn 사유로만.
         var csBad = s.ConnectionServers.Where(c => !Healthy.Cs(c.Status)).ToList();
-        if (s.CsTotal > 0 && csBad.Count == s.CsTotal)
+        var csDead = csBad.Where(c => !string.Equals(c.Status?.Trim(), "RESTART_REQUIRED", StringComparison.OrdinalIgnoreCase)).ToList();
+        if (s.CsTotal > 0 && csDead.Count == s.CsTotal)
         {
             s.Status = HealthStatus.Down;
-            s.Error = "커넥션서버 전체 이상: " + string.Join(", ", csBad.Select(c => $"{c.Name}={c.Status}"));
+            s.Error = "커넥션서버 전체 이상: " + string.Join(", ", csDead.Select(c => $"{c.Name}={c.Status}"));
             return;
         }
         if (csBad.Count > 0)

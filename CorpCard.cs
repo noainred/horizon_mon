@@ -29,12 +29,25 @@ public sealed class CorpCard : Panel
     public CorpCard()
     {
         DoubleBuffered = true;
+        ResizeRedraw = true;
         SetStyle(ControlStyles.StandardClick | ControlStyles.StandardDoubleClick, true); // 더블클릭 이벤트 활성
         Width = 320;
         Height = 168;
         Margin = new Padding(8);
         Cursor = Cursors.Hand;
         BackColor = Color.White;
+    }
+
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        // 고DPI에서 카드 크기 스케일(텍스트는 포인트 단위라 자동 스케일 — 상자만 맞춰준다).
+        var s = DeviceDpi / 96f;
+        if (Math.Abs(s - 1f) > 0.01f)
+        {
+            Width = (int)(320 * s);
+            Height = (int)(168 * s);
+        }
     }
 
     public void SetData(CorpStatus cs, List<HistoryPoint> recent)
@@ -56,6 +69,8 @@ public sealed class CorpCard : Panel
         var status = _cs.Status;
         var color = MainForm.StatusColor(status, corp.Enabled);
         int w = Width, h = Height;
+        float ds = DeviceDpi / 96f;              // 고DPI 스케일(텍스트는 포인트라 자동, 좌표만 보정)
+        int P(float v) => (int)(v * ds);
 
         // 카드 배경 + 테두리 + 좌측 상태 스트라이프
         using (var bg = new SolidBrush(corp.Enabled ? Color.White : Color.FromArgb(248, 249, 250)))
@@ -63,15 +78,15 @@ public sealed class CorpCard : Panel
         using (var border = new Pen(Color.FromArgb(226, 229, 233)))
             g.DrawRectangle(border, 0, 0, w - 1, h - 1);
         using (var stripe = new SolidBrush(color))
-            g.FillRectangle(stripe, 0, 0, 6, h - 1);
+            g.FillRectangle(stripe, 0, 0, P(6), h - 1);
 
         // 헤더: 법인명 / 리전 / 서버
         using var dark = new SolidBrush(Color.FromArgb(33, 37, 41));
         using var gray = new SolidBrush(Color.FromArgb(134, 142, 150));
-        g.DrawString(Ellipsis(g, corp.DisplayName, FName, w - 120), FName, dark, 16, 10);
+        g.DrawString(Ellipsis(g, corp.DisplayName, FName, w - P(120)), FName, dark, P(16), P(10));
         var sub = string.IsNullOrEmpty(corp.Region) ? "Horizon" : $"Horizon · {corp.Region}";
-        g.DrawString(Ellipsis(g, sub, FSub, w - 120), FSub, gray, 16, 33);
-        g.DrawString(Ellipsis(g, corp.BaseUrl, FHost, w - 24), FHost, gray, 16, 52);
+        g.DrawString(Ellipsis(g, sub, FSub, w - P(120)), FSub, gray, P(16), P(33));
+        g.DrawString(Ellipsis(g, corp.BaseUrl, FHost, w - P(24)), FHost, gray, P(16), P(52));
 
         // 우측 상단: 큰 세션 수 + 상태 라벨
         using var statBrush = new SolidBrush(color);
@@ -80,12 +95,12 @@ public sealed class CorpCard : Panel
             : s != null ? $"{s.SessionTotal:N0}"
             : "—";
         var bigSz = g.MeasureString(big, FBig);
-        g.DrawString(big, FBig, statBrush, w - bigSz.Width - 14, 8);
+        g.DrawString(big, FBig, statBrush, w - bigSz.Width - P(14), P(8));
         var statText = status == HealthStatus.Down || !corp.Enabled
             ? MainForm.StatusText(status, corp.Enabled)
             : $"세션 · {MainForm.StatusText(status, corp.Enabled)}";
         var stSz = g.MeasureString(statText, FStat);
-        g.DrawString(statText, FStat, statBrush, w - stSz.Width - 14, 8 + bigSz.Height - 2);
+        g.DrawString(statText, FStat, statBrush, w - stSz.Width - P(14), P(8) + bigSz.Height - 2);
 
         // 지표 행 1: CS / 게이트웨이 / 팜 · 지표 행 2: 세션호스트 / 문제머신 / 인증서
         if (s != null)
@@ -94,7 +109,7 @@ public sealed class CorpCard : Panel
             if (s.GwTotal > 0) m1.Add($"GW {s.GwOk}/{s.GwTotal}");
             if (s.FarmTotal > 0) m1.Add($"팜 {s.FarmOk}/{s.FarmTotal}");
             if (s.DesktopPools.Count > 0) m1.Add($"풀 {s.DesktopPools.Count}");
-            g.DrawString(string.Join("  ·  ", m1), FMetric, gray, 16, 74);
+            g.DrawString(string.Join("  ·  ", m1), FMetric, gray, P(16), P(74));
 
             var m2 = new List<string>();
             if (s.RdsTotal > 0) m2.Add($"세션호스트 {s.RdsOk}/{s.RdsTotal}");
@@ -104,15 +119,15 @@ public sealed class CorpCard : Panel
             m2.Add(AgeText(s.TimestampUtc));
             using var m2Brush = s.ProblemMachines.Count > 0 || HealthEvaluatorHasRdsIssue(s)
                 ? new SolidBrush(Color.FromArgb(190, 120, 20)) : new SolidBrush(Color.FromArgb(134, 142, 150));
-            g.DrawString(string.Join("  ·  ", m2), FMetric, m2Brush, 16, 90);
+            g.DrawString(string.Join("  ·  ", m2), FMetric, m2Brush, P(16), P(90));
         }
         else
         {
-            g.DrawString(corp.Enabled ? "수집 대기" : "설정에서 주소/계정 입력 후 활성화", FMetric, gray, 16, 74);
+            g.DrawString(corp.Enabled ? "수집 대기" : "설정에서 주소/계정 입력 후 활성화", FMetric, gray, P(16), P(74));
         }
 
         // 하단 스파크라인(세션 수 + 상태 색 점)
-        DrawSparkline(g, new Rectangle(14, 110, w - 26, h - 110 - 10), color);
+        DrawSparkline(g, new Rectangle(P(14), P(110), w - P(26), h - P(110) - P(10)), color);
     }
 
     private static bool HealthEvaluatorHasRdsIssue(CorpSnapshot s)
